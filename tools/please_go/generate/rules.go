@@ -3,19 +3,22 @@ package generate
 import "github.com/bazelbuild/buildtools/build"
 
 type Rule struct {
-	name          string
-	kind          string
-	srcs          []string
-	cgoSrcs       []string
-	compilerFlags []string
-	linkerFlags   []string
-	pkgConfigs    []string
-	asmFiles      []string
-	hdrs          []string
-	deps          []string
-	embedPatterns []string
-	// TODO(jpoole):  handle external test
-	external bool
+	name           string
+	kind           string
+	module         string
+	subrepo        string
+	srcs           []string
+	cgoSrcs        []string
+	cSrcs          []string
+	compilerFlags  []string
+	linkerFlags    []string
+	pkgConfigs     []string
+	asmFiles       []string
+	hdrs           []string
+	deps           []string
+	embedPatterns  []string
+	isCMD          bool
+	isLargePackage bool
 }
 
 func populateRule(r *build.Rule, targetState *Rule) {
@@ -25,10 +28,13 @@ func populateRule(r *build.Rule, targetState *Rule) {
 	} else {
 		r.SetAttr("srcs", NewStringList(targetState.srcs))
 	}
+	if len(targetState.cSrcs) > 0 {
+		r.SetAttr("c_srcs", NewStringList(targetState.cSrcs))
+	}
 	if len(targetState.deps) > 0 {
 		r.SetAttr("deps", NewStringList(targetState.deps))
 	}
-	if len(targetState.compilerFlags) > 0 {
+	if len(targetState.pkgConfigs) > 0 {
 		r.SetAttr("pkg_config", NewStringList(targetState.pkgConfigs))
 	}
 	if len(targetState.compilerFlags) > 0 {
@@ -43,9 +49,6 @@ func populateRule(r *build.Rule, targetState *Rule) {
 	if len(targetState.asmFiles) > 0 {
 		r.SetAttr("asm_srcs", NewStringList(targetState.asmFiles))
 	}
-	if len(targetState.deps) > 0 {
-		r.SetAttr("deps", NewStringList(targetState.deps))
-	}
 	if len(targetState.embedPatterns) > 0 {
 		r.SetAttr("resources", &build.CallExpr{
 			X: &build.Ident{Name: "glob"},
@@ -53,5 +56,12 @@ func populateRule(r *build.Rule, targetState *Rule) {
 				NewStringList(targetState.embedPatterns),
 			},
 		})
+	}
+	if !targetState.isCMD {
+		r.SetAttr("_module", NewStringExpr(targetState.module))
+		r.SetAttr("_subrepo", NewStringExpr(targetState.subrepo))
+	}
+	if targetState.isLargePackage {
+		r.SetAttr("_is_large_package", NewBoolExpr(true))
 	}
 }

@@ -8,8 +8,11 @@ import (
 	"go/build"
 	"io"
 	"io/fs"
+	"log"
 	"os"
 	"path/filepath"
+	"runtime"
+	"slices"
 	"sort"
 	"strings"
 
@@ -17,9 +20,10 @@ import (
 )
 
 // WritePackageInfo writes a series of package info files to the given file.
-func WritePackageInfo(modulePath, strip, src, importconfig string, imports map[string]string, installPkgs []string, w io.Writer) error {
+func WritePackageInfo(importPath string, srcRoot, importconfig string, imports map[string]string, installPkgs []string, subrepo, module string, w io.Writer) error {
 	// Discover all Go files in the module
 	goFiles := map[string][]string{}
+	module = modulePath(module, importPath)
 
 	walkDirFunc := func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -36,16 +40,16 @@ func WritePackageInfo(modulePath, strip, src, importconfig string, imports map[s
 	for _, pkg := range installPkgs {
 		if strings.Contains(pkg, "...") {
 			pkg = strings.TrimSuffix(pkg, "...")
-			if err := filepath.WalkDir(filepath.Join(src, pkg), walkDirFunc); err != nil {
+			if err := filepath.WalkDir(filepath.Join(srcRoot, pkg), walkDirFunc); err != nil {
 				return fmt.Errorf("failed to read module dir: %w", err)
 			}
 		} else {
-			dir := filepath.Join(src, pkg)
-			goFiles[dir] = append(goFiles[dir], filepath.Join(src, pkg))
+			dir := filepath.Join(srcRoot, pkg)
+			goFiles[dir] = append(goFiles[dir], filepath.Join(srcRoot, pkg))
 		}
 	}
 	if len(installPkgs) == 0 {
-		if err := filepath.WalkDir(src, walkDirFunc); err != nil {
+		if err := filepath.WalkDir(srcRoot, walkDirFunc); err != nil {
 			return fmt.Errorf("failed to read module dir: %w", err)
 		}
 	}
@@ -58,24 +62,56 @@ func WritePackageInfo(modulePath, strip, src, importconfig string, imports map[s
 	}
 	pkgs := make([]*packages.Package, 0, len(goFiles))
 	for dir := range goFiles {
-		pkgDir := strings.TrimPrefix(strings.TrimPrefix(dir, strip), "/")
-		pkg, err := createPackage(filepath.Join(modulePath, pkgDir), dir)
+		pkgDir := strings.TrimPrefix(strings.TrimPrefix(dir, srcRoot), "/")
+		pkg, err := createPackage(filepath.Join(importPath, pkgDir), dir, subrepo, module)
 		if _, ok := err.(*build.NoGoError); ok {
 			continue // Don't really care, this happens sometimes for modules
 		} else if err != nil {
 			return fmt.Errorf("failed to import directory %s: %w", dir, err)
 		}
-		pkg.ExportFile = imports[pkg.PkgPath]
+		if subrepo != "" {
+			_, pkgPath, ok := strings.Cut(imports[pkg.PkgPath], pkg.PkgPath)
+			if !ok {
+				return fmt.Errorf("Cannot determine export file path for package %s from %s", pkg.PkgPath, imports[pkg.PkgPath])
+			}
+			// This is a really gross hack to sneak both paths through the one field.
+			pkg.ExportFile = filepath.Join(subrepo, pkgPath) + "|" + imports[pkg.PkgPath]
+		} else {
+			pkg.ExportFile = imports[pkg.PkgPath]
+		}
 		pkgs = append(pkgs, pkg)
+	}
+	// If we're doing the stdlib, limit it to just things in the importconfig (i.e. no cmd/ packages)
+	if importconfig != "" {
+		pkgs = slices.DeleteFunc(pkgs, func(pkg *packages.Package) bool {
+			_, present := imports[pkg.PkgPath]
+			return !present
+		})
+	}
+	// Vendor packages. They aren't identified by the original imports but we know what they are now.
+	vendorised := map[string]*packages.Package{}
+	for _, pkg := range pkgs {
+		if strings.HasPrefix(pkg.PkgPath, "vendor/") {
+			vendorised[strings.TrimPrefix(pkg.PkgPath, "vendor/")] = pkg
+		}
+	}
+	for _, pkg := range pkgs {
+		for k := range pkg.Imports {
+			if v, present := vendorised[k]; present {
+				pkg.Imports[k] = v
+			}
+		}
 	}
 	// Ensure output is deterministic
 	sort.Slice(pkgs, func(i, j int) bool {
 		return pkgs[i].ID < pkgs[j].ID
 	})
-	return serialise(pkgs, w)
+	e := json.NewEncoder(w)
+	e.SetIndent("", "  ")
+	return e.Encode(pkgs)
 }
 
-func createPackage(pkgPath, pkgDir string) (*packages.Package, error) {
+func createPackage(pkgPath, pkgDir, subrepo, module string) (*packages.Package, error) {
 	if pkgDir == "" || pkgDir == "." {
 		// This happens when we're in the repo root, ImportDir refuses to read it for some reason.
 		path, err := filepath.Abs(pkgDir)
@@ -89,30 +125,34 @@ func createPackage(pkgPath, pkgDir string) (*packages.Package, error) {
 		return nil, err
 	}
 	bpkg.ImportPath = pkgPath
-	return FromBuildPackage(bpkg), nil
-}
-
-func serialise(pkgs []*packages.Package, w io.Writer) error {
-	e := json.NewEncoder(w)
-	e.SetIndent("", "  ")
-	return e.Encode(pkgs)
+	return FromBuildPackage(bpkg, subrepo, module), nil
 }
 
 // FromBuildPackage creates a packages Package from a build Package.
-func FromBuildPackage(pkg *build.Package) *packages.Package {
+func FromBuildPackage(pkg *build.Package, subrepo, module string) *packages.Package {
 	p := &packages.Package{
-		ID:            pkg.ImportPath,
-		Name:          pkg.Name,
-		PkgPath:       pkg.ImportPath,
-		GoFiles:       make([]string, len(pkg.GoFiles)),
-		OtherFiles:    mappend(pkg.CFiles, pkg.CXXFiles, pkg.MFiles, pkg.HFiles, pkg.SFiles, pkg.SwigFiles, pkg.SwigCXXFiles, pkg.SysoFiles),
-		EmbedPatterns: pkg.EmbedPatterns,
-		Imports:       make(map[string]*packages.Package, len(pkg.Imports)),
+		ID:              pkg.ImportPath,
+		Name:            pkg.Name,
+		PkgPath:         pkg.ImportPath,
+		GoFiles:         make([]string, len(pkg.GoFiles)),
+		CompiledGoFiles: make([]string, len(pkg.GoFiles)),
+		OtherFiles:      mappend(pkg.CFiles, pkg.CXXFiles, pkg.MFiles, pkg.HFiles, pkg.SFiles, pkg.SwigFiles, pkg.SwigCXXFiles, pkg.SysoFiles),
+		EmbedPatterns:   pkg.EmbedPatterns,
+		Imports:         make(map[string]*packages.Package, len(pkg.Imports)),
 	}
 	for i, file := range pkg.GoFiles {
-		p.GoFiles[i] = filepath.Join(pkg.Dir, file)
+		if subrepo != "" {
+			// this is fairly nasty... there must be a better way of getting it without the pkg/ prefix
+			log.Printf("here %s | %s | %s | %s", subrepo, pkg.Dir, file, module)
+			dir := strings.TrimPrefix(pkg.Dir, "pkg/"+runtime.GOOS+"_"+runtime.GOARCH)
+			dir = strings.TrimPrefix(strings.TrimPrefix(dir, "/"), module)
+			p.GoFiles[i] = filepath.Join(subrepo, dir, file)
+			p.CompiledGoFiles[i] = filepath.Join(pkg.Dir, file) // Stash this here for later
+		} else {
+			p.GoFiles[i] = filepath.Join(pkg.Dir, file)
+			p.CompiledGoFiles[i] = filepath.Join(pkg.Dir, file)
+		}
 	}
-	p.CompiledGoFiles = p.GoFiles // This seems to be important to e.g. gosec
 	for _, imp := range pkg.Imports {
 		p.Imports[imp] = &packages.Package{ID: imp, PkgPath: imp}
 	}
@@ -145,4 +185,13 @@ func loadImportConfig(filename string) (map[string]string, error) {
 		}
 	}
 	return m, nil
+}
+
+// modulePath returns the import path for a module, or the given one if the module isn't set.
+func modulePath(module, importPath string) string {
+	if module == "" {
+		return importPath
+	}
+	before, _, _ := strings.Cut(module, "@")
+	return before
 }

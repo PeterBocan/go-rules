@@ -10,11 +10,9 @@ import (
 	"github.com/peterebden/go-cli-init/v5/flags"
 
 	"github.com/please-build/go-rules/tools/please_go/cover"
-	"github.com/please-build/go-rules/tools/please_go/covervars"
 	"github.com/please-build/go-rules/tools/please_go/embed"
 	"github.com/please-build/go-rules/tools/please_go/filter"
 	"github.com/please-build/go-rules/tools/please_go/generate"
-	"github.com/please-build/go-rules/tools/please_go/goget"
 	"github.com/please-build/go-rules/tools/please_go/install"
 	"github.com/please-build/go-rules/tools/please_go/modinfo"
 	"github.com/please-build/go-rules/tools/please_go/packageinfo"
@@ -35,7 +33,7 @@ var opts = struct {
 		CCTool            string   `short:"c" long:"cc_tool" description:"The c compiler to use"`
 		Out               string   `short:"o" long:"out" description:"The output directory to put compiled artifacts in" required:"true"`
 		TrimPath          string   `short:"t" long:"trim_path" description:"Removes prefix from recorded source file paths."`
-		PackageConfigTool string   `short:"p" long:"pkg_config_tool" description:"The path to the pkg config" default:"pkg-config"`
+		PackageConfigTool string   `short:"p" long:"pkg_config_tool" env:"PKG_CONFIG_TOOL" description:"The path to the pkg config" default:"pkg-config"`
 		Args              struct {
 			Packages []string `positional-arg-name:"packages" description:"The packages to compile"`
 		} `positional-args:"true" required:"true"`
@@ -52,18 +50,13 @@ var opts = struct {
 			Sources []string `positional-arg-name:"sources" description:"Test source files" required:"true"`
 		} `positional-args:"true" required:"true"`
 	} `command:"testmain" alias:"t" description:"Generates a go main package to run the tests in a package."`
-	CoverVars struct {
-		ImportPath string `short:"i" long:"import_path" description:"The import path for the source files"`
-		Args       struct {
-			Sources []string `positional-arg-name:"sources" description:"Source files to generate embed config for"`
-		} `positional-args:"true"`
-	} `command:"covervars" description:"Generates coverage variable config for a set of go src files"`
 	Cover struct {
-		GoTool      string `short:"g" long:"go" default:"go" description:"Go binary to run"`
+		GoTool      string `short:"g" long:"go" default:"go" env:"TOOLS_GO" description:"Go binary to run"`
+		CoverTool   string `short:"t" long:"go_cover" env:"TOOLS_COVER" description:"Go coverage tool to run"`
 		CoverageCfg string `short:"c" long:"covcfg" required:"true" description:"Output coveragecfg file to feed into go tool compile"`
 		Output      string `short:"o" long:"output" required:"true" description:"File that will contain output names of modified files"`
 		Pkg         string `long:"pkg" env:"PKG_DIR" description:"Package that we're in within the repo"`
-		PkgName     string `short:"p" long:"pkg_name" description:"Name of the package we're compiling"`
+		PkgName     string `short:"p" long:"pkg_name" hidden:"true" description:"Deprecated, has no effect"`
 		Args        struct {
 			Sources []string `positional-arg-name:"sources" required:"true" description:"Source files to generate embed config for"`
 		} `positional-args:"true"`
@@ -78,15 +71,16 @@ var opts = struct {
 		Args struct {
 			Sources []string `positional-arg-name:"sources" description:"Source files to generate embed config for"`
 		} `positional-args:"true"`
-	} `command:"embed" alias:"f" description:"Filter go sources based on the go build tag rules."`
+	} `command:"embed" alias:"e" description:"Generate embed config for a set of Go source files"`
 	PackageInfo struct {
 		ImportPath string            `short:"i" long:"import_path" description:"Go import path (e.g. github.com/please-build/go-rules)"`
 		Pkg        string            `long:"pkg" env:"PKG_DIR" description:"Package that we're in within the repo"`
 		ImportMap  map[string]string `short:"m" long:"import_map" description:"Existing map of imports"`
+		Subrepo    string            `short:"s" long:"subrepo" description:"Subrepo root that this package is within"`
+		Module     string            `long:"mod" description:"The module this is within, if present"`
 	} `command:"package_info" alias:"p" description:"Creates an info file about a Go package"`
 	ModuleInfo struct {
 		ModulePath   string   `short:"m" long:"module_path" required:"true" description:"Import path of the module in question"`
-		Strip        string   `short:"s" long:"strip" description:"Prefix to strip off package directories"`
 		Srcs         string   `long:"srcs" env:"SRCS_SRCS" required:"true" description:"Source files of the module"`
 		ImportConfig string   `long:"importconfig" env:"SRCS_IC" description:"Importconfig file for locating gc export data"`
 		Packages     []string `short:"p" long:"packages" description:"Packages to include in the module"`
@@ -95,19 +89,18 @@ var opts = struct {
 		SrcRoot          string   `short:"r" long:"src_root" description:"The src root of the module to inspect"`
 		ImportPath       string   `long:"import_path" description:"overrides the module's import path. If not set, the import path from the go.mod will be used.'"`
 		ThirdPartyFolder string   `short:"t" long:"third_part_folder" description:"The folder containing the third party subrepos" default:"third_party/go"`
-		ModFile          string   `long:"mod_file" description:"Path to the mod file to use to resolve dependencies against"`
+		ModFile          string   `long:"mod_file" description:"Path to the host repo mod file to use to resolve dependencies against (dependencies will be resolved against the module as well if it exists)"`
 		Module           string   `long:"module" description:"The name of the current module"`
+		Version          string   `long:"version" description:"The version of the current module"`
 		Install          []string `long:"install" description:"The packages to add to the :install alias"`
+		BuildTags        []string `long:"build_tag" description:"Any build tags to apply to the build"`
+		Subrepo          string   `long:"subrepo" description:"The subrepo root to output into"`
+		Labels           []string `long:"label" description:"Additional labels to attach to subrepo targets"`
+		LargePackages    []string `long:"large_package" description:"Relative names of packages which have lots of input files (meaning the go_library target should be marked as large)"`
 		Args             struct {
 			Requirements []string `positional-arg-name:"requirements" description:"Any module requirements not included in the go.mod"`
 		} `positional-args:"true"`
-	} `command:"generate" alias:"f" description:"Filter go sources based on the go build tag rules."`
-	GoGet struct {
-		ModFile string `short:"m" long:"mod_file" description:"A go.mod file to use as a set of reuirementzs"`
-		Args    struct {
-			Requirements []string `positional-arg-name:"requirements" description:"a set of module@version pairs"`
-		} `positional-args:"true"`
-	} `command:"get" description:"Generate go_get rules"`
+	} `command:"generate" alias:"g" description:"Generate build targets for a Go module"`
 	ModInfo struct {
 		GoTool     string `short:"g" long:"go" env:"TOOLS_GO" required:"true" description:"The Go tool we'll use"`
 		ModulePath string `short:"m" long:"module_path" description:"The path for the module being built"`
@@ -119,6 +112,12 @@ var opts = struct {
 		GoOS       string `long:"goos" env:"OS" description:"OS we're compiling for"`
 		GoArch     string `long:"goarch" env:"ARCH" description:"Architecture we're compiling for"`
 	} `command:"modinfo" description:"Generates Go modinfo for the linter"`
+	GenerateModuleVersion struct {
+		ModulePath string `short:"m" long:"module_path" required:"true" description:"The module's path"`
+		Version    string `long:"version" required:"true" description:"The module's (semantic) version number"`
+		Validate   bool   `long:"validate" description:"Check validity of the given module import path and version number"`
+		Out        string `short:"o" long:"out" env:"OUT" required:"true" description:"File to write the output to"`
+	} `command:"generate_module_version" description:"Generates a module version file for a third-party Go module"`
 }{
 	Usage: `
 please-go is used by the go build rules to compile and test go modules and packages.
@@ -153,13 +152,9 @@ var subCommands = map[string]func() int{
 		return 0
 	},
 	"cover": func() int {
-		if err := cover.WriteCoverage(opts.Cover.GoTool, opts.Cover.CoverageCfg, opts.Cover.Output, opts.Cover.Pkg, opts.Cover.PkgName, opts.Cover.Args.Sources); err != nil {
+		if err := cover.WriteCoverage(opts.Cover.GoTool, opts.Cover.CoverTool, opts.Cover.CoverageCfg, opts.Cover.Output, opts.Cover.Pkg, opts.Cover.Args.Sources); err != nil {
 			log.Fatalf("failed to write coverage: %s", err)
 		}
-		return 0
-	},
-	"covervars": func() int {
-		covervars.GenCoverVars(os.Stdout, opts.CoverVars.ImportPath, opts.CoverVars.Args.Sources)
 		return 0
 	},
 	"filter": func() int {
@@ -173,34 +168,23 @@ var subCommands = map[string]func() int{
 		return 0
 	},
 	"generate": func() int {
-		g := generate.New(opts.Generate.SrcRoot, opts.Generate.ThirdPartyFolder, opts.Generate.ModFile, opts.Generate.Module, []string{"BUILD", "BUILD.plz"}, opts.Generate.Args.Requirements, opts.Generate.Install)
+		gen := opts.Generate
+		g := generate.New(gen.SrcRoot, gen.ThirdPartyFolder, gen.ModFile, gen.Module, gen.Version, gen.Subrepo, []string{"BUILD", "BUILD.plz"}, gen.Args.Requirements, gen.Install, gen.BuildTags, gen.Labels, gen.LargePackages)
 		if err := g.Generate(); err != nil {
-			log.Fatalf("failed to generate go rules: %v", err)
-		}
-		return 0
-	},
-	"get": func() int {
-		if opts.GoGet.ModFile != "" {
-			if err := goget.GetMod(opts.GoGet.ModFile); err != nil {
-				log.Fatalf("failed to generate go rules: %v", err)
-			}
-			return 0
-		}
-		if err := goget.GoGet(opts.GoGet.Args.Requirements); err != nil {
 			log.Fatalf("failed to generate go rules: %v", err)
 		}
 		return 0
 	},
 	"package_info": func() int {
 		pi := opts.PackageInfo
-		if err := packageinfo.WritePackageInfo(pi.ImportPath, "", pi.Pkg, "", pi.ImportMap, nil, os.Stdout); err != nil {
+		if err := packageinfo.WritePackageInfo(pi.ImportPath, pi.Pkg, "", pi.ImportMap, nil, pi.Subrepo, pi.Module, os.Stdout); err != nil {
 			log.Fatalf("failed to write package info: %s", err)
 		}
 		return 0
 	},
 	"module_info": func() int {
 		mi := opts.ModuleInfo
-		if err := packageinfo.WritePackageInfo(mi.ModulePath, mi.Strip, mi.Srcs, mi.ImportConfig, nil, mi.Packages, os.Stdout); err != nil {
+		if err := packageinfo.WritePackageInfo(mi.ModulePath, mi.Srcs, mi.ImportConfig, nil, mi.Packages, "", "", os.Stdout); err != nil {
 			log.Fatalf("failed to write module info: %s", err)
 		}
 		return 0
@@ -216,6 +200,13 @@ var subCommands = map[string]func() int{
 		}
 		if err := modinfo.WriteModInfo(mi.GoTool, mi.ModulePath, filepath.Join(mi.ModulePath, mi.Pkg), mi.BuildMode, mi.CgoEnabled, mi.GoOS, mi.GoArch, mi.Out); err != nil {
 			log.Fatalf("failed to write modinfo: %s", err)
+		}
+		return 0
+	},
+	"generate_module_version": func() int {
+		mv := opts.GenerateModuleVersion
+		if err := modinfo.WriteModuleVersion(mv.ModulePath, mv.Version, mv.Validate, mv.Out); err != nil {
+			log.Fatalf("failed to generate module version file: %v", err)
 		}
 		return 0
 	},

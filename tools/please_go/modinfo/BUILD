@@ -12,6 +12,9 @@ go_library(
     visibility = [
         "//tools/please_go/...",
     ],
+    deps = [
+        "///third_party/go/golang.org_x_mod//module",
+    ],
 )
 
 go_test(
@@ -19,7 +22,7 @@ go_test(
     srcs = ["modinfo_test.go"],
     external = True,
     deps = [
-        ":modinfo",
-        "//third_party/go:testify",
+        "///third_party/go/github.com_stretchr_testify//assert",
+        "///third_party/go/github.com_stretchr_testify//require",
     ],
 )

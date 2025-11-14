@@ -5,13 +5,22 @@ package cover
 import (
 	"bytes"
 	"encoding/json"
+	"go/parser"
+	"go/token"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
+
+	"github.com/please-build/go-rules/tools/please_go/install/toolchain"
 )
 
 // WriteCoverage writes the necessary Go coverage information for a set of sources.
-func WriteCoverage(goTool, covercfg, output, pkg, pkgName string, srcs []string) error {
+func WriteCoverage(goTool, coverTool, covercfg, output, pkg string, srcs []string) error {
+	pkgName, err := packageName(srcs[0])
+	if err != nil {
+		return err
+	}
 	const pkgConfigFile = "pkgcfg"
 	b, _ := json.Marshal(coverConfig{
 		OutConfig:   covercfg,
@@ -23,16 +32,30 @@ func WriteCoverage(goTool, covercfg, output, pkg, pkgName string, srcs []string)
 		return err
 	}
 	var buf bytes.Buffer
+	// 1.21 requires a cover vars file to be written into the output file list
+	if coverTool != "" || needs121CoverVars(goTool) {
+		buf.WriteString(filepath.Join(filepath.Dir(srcs[0]), "_covervars.cover.go\n"))
+	}
 	for _, src := range srcs {
 		buf.WriteString(strings.TrimSuffix(src, ".go") + ".cover.go\n")
 	}
 	if err := os.WriteFile(output, buf.Bytes(), 0644); err != nil {
 		return err
 	}
-	cmd := exec.Command(goTool, append([]string{"tool", "cover", "-mode=set", "-var=goCover", "-pkgcfg", pkgConfigFile, "-outfilelist", output}, srcs...)...)
+	var cmd *exec.Cmd
+	if coverTool != "" {
+		cmd = exec.Command(coverTool, append([]string{"-mode=set", "-var=_plz_goCover", "-pkgcfg", pkgConfigFile, "-outfilelist", output}, srcs...)...)
+	} else {
+		cmd = exec.Command(goTool, append([]string{"tool", "cover", "-mode=set", "-var=_plz_goCover", "-pkgcfg", pkgConfigFile, "-outfilelist", output}, srcs...)...)
+	}
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
+}
+
+func needs121CoverVars(goTool string) bool {
+	version, err := toolchain.GoMinorVersion(goTool)
+	return err == nil && version >= 21
 }
 
 // This is a copy of the one from internal/coverage (why does that need to be internal??)
@@ -42,4 +65,14 @@ type coverConfig struct {
 	PkgName     string
 	Granularity string
 	ModulePath  string
+}
+
+// packageName returns the Go package for a file.
+func packageName(filename string) (string, error) {
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, filename, nil, parser.PackageClauseOnly)
+	if err != nil {
+		return "", err
+	}
+	return f.Name.Name, nil
 }

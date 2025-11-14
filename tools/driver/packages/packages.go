@@ -7,6 +7,7 @@ import (
 	"go/build"
 	"go/types"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -78,30 +79,65 @@ func Load(req *DriverRequest, files []string) (*DriverResponse, error) {
 	if err := os.Chdir(rootpath); err != nil {
 		return nil, err
 	}
-	// Now we have to make the filepaths relative, so plz understands them
-	// When https://github.com/thought-machine/please/issues/2618 is resolved, we won't need to do this.
-	relFiles := make([]string, len(files))
-	for i, file := range files {
-		file, err = filepath.Rel(rootpath, file)
-		if err != nil {
-			return nil, err
-		}
-		relFiles[i] = file
-	}
 	// Now turn these back into the set of original directories; we use these to determine roots later
 	dirs := map[string]struct{}{}
-	for _, file := range relFiles {
+	for _, file := range files {
 		dirs[filepath.Dir(file)] = struct{}{}
 	}
-	pkgs, err := loadPackageInfo(relFiles)
+	pkgs, err := loadPackageInfo(files, req.Mode)
 	if err != nil {
 		return nil, err
 	}
+	return packagesToResponse(rootpath, pkgs, dirs)
+}
+
+// LoadOffline is like Load but rather than querying plz to find the file to load, it just
+// walks a file tree looking for pkg_info.json files.
+func LoadOffline(req *DriverRequest, searchDir string, files []string) (*DriverResponse, error) {
+	pkgs := []*packages.Package{}
+	if err := filepath.WalkDir(searchDir, func(path string, d fs.DirEntry, err error) error {
+		lpkgs := []*packages.Package{}
+		if err != nil || d.IsDir() || !strings.HasSuffix(path, "pkg_info.json") {
+			return err
+		} else if b, err := os.ReadFile(path); err != nil {
+			return fmt.Errorf("failed to read %s: %w", path, err)
+		} else if err := json.Unmarshal(b, &lpkgs); err != nil {
+			return fmt.Errorf("failed to decode %s: %w", path, err)
+		}
+		for _, pkg := range lpkgs {
+			if _, after, found := strings.Cut(pkg.ExportFile, "|"); found {
+				pkg.ExportFile = after
+			}
+			pkg.GoFiles = pkg.CompiledGoFiles
+		}
+		pkgs = append(pkgs, lpkgs...)
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	dirs := map[string]struct{}{}
+	for _, file := range files {
+		// Inputs that are files need to get turned into their package directory
+		if info, err := os.Stat(file); err == nil && !info.IsDir() {
+			file = filepath.Dir(file)
+		}
+		dirs[file] = struct{}{}
+	}
+	log.Debug("Generating response for %s", dirs)
+	return packagesToResponse(searchDir, pkgs, dirs)
+}
+
+func packagesToResponse(rootpath string, pkgs []*packages.Package, dirs map[string]struct{}) (*DriverResponse, error) {
 	// Build the set of root packages
 	seenRoots := map[string]struct{}{}
 	roots := []string{}
 	seenRuntime := false
 	for _, pkg := range pkgs {
+		if _, present := dirs[pkg.PkgPath]; present {
+			seenRoots[pkg.ID] = struct{}{}
+			roots = append(roots, pkg.ID)
+			continue
+		}
 		for _, file := range pkg.GoFiles {
 			if _, present := dirs[filepath.Dir(file)]; present {
 				if _, present := seenRoots[pkg.ID]; !present {
@@ -121,10 +157,12 @@ func Load(req *DriverRequest, files []string) (*DriverResponse, error) {
 		for i, file := range pkg.GoFiles {
 			// This is pretty awkward; we need to try to figure out where these files exist now,
 			// which isn't particularly clear to the build actions that generated them.
-			if _, err := os.Lstat(file); err == nil { // file exists
-				pkg.GoFiles[i] = filepath.Join(rootpath, file)
+			if path := filepath.Join(rootpath, "plz-out/subrepos", file); pathExists(path) {
+				pkg.GoFiles[i] = path
+			} else if path := filepath.Join(rootpath, "plz-out/gen", file); pathExists(path) {
+				pkg.GoFiles[i] = path
 			} else {
-				pkg.GoFiles[i] = filepath.Join(rootpath, "plz-out/gen", file)
+				pkg.GoFiles[i] = filepath.Join(rootpath, file)
 			}
 		}
 		pkg.CompiledGoFiles = pkg.GoFiles
@@ -155,7 +193,7 @@ func Load(req *DriverRequest, files []string) (*DriverResponse, error) {
 // loadPackageInfo loads all the package information by executing Please.
 // A cooler way of handling this in future would be to do this in-process; for that we'd
 // need to define the SDK we keep talking about as a supported programmatic interface.
-func loadPackageInfo(files []string) ([]*packages.Package, error) {
+func loadPackageInfo(files []string, mode packages.LoadMode) ([]*packages.Package, error) {
 	isTerminal := term.IsTerminal(int(os.Stderr.Fd()))
 	plz := func(args ...string) *exec.Cmd {
 		cmd := exec.Command("plz", args...)
@@ -178,7 +216,11 @@ func loadPackageInfo(files []string) ([]*packages.Package, error) {
 	// N.B. deliberate not to close these here, they happen exactly when needed.
 	whatinputs := plz(append([]string{"query", "whatinputs"}, files...)...)
 	whatinputs.Stdout = w1
-	deps := plz("query", "deps", "-", "--hidden", "--include", "go_pkg_info", "--include", "go_src")
+	args := []string{"query", "deps", "-", "--hidden", "-i", "go_pkg_info", "-i", "go_src"}
+	if (mode & packages.NeedExportFile) != 0 {
+		args = append(args, "-i", "go")
+	}
+	deps := plz(args...)
 	deps.Stdin = r1
 	deps.Stdout = w2
 	build := plz("build", "-")
@@ -207,17 +249,23 @@ func loadPackageInfo(files []string) ([]*packages.Package, error) {
 	if err := build.Wait(); err != nil {
 		return nil, handleSubprocessErr(build, err)
 	}
-	log.Debug("Loading plz package info files...")
 	// Now we can read all the package info files from the build process' stdout.
+	return loadPackageInfoFiles(strings.Fields(strings.TrimSpace(build.Stdout.(*bytes.Buffer).String())))
+}
+
+// loadPackageInfoFiles loads the given set of package info files
+func loadPackageInfoFiles(paths []string) ([]*packages.Package, error) {
+	log.Debug("Loading plz package info files...")
 	pkgs := []*packages.Package{}
 	var lock sync.Mutex
 	var g errgroup.Group
 	g.SetLimit(8) // arbitrary limit since we're doing I/O
-	for _, file := range strings.Fields(strings.TrimSpace(build.Stdout.(*bytes.Buffer).String())) {
+	for _, file := range paths {
 		file := file
 		if !strings.HasSuffix(file, ".json") {
 			continue // Ignore all the various Go sources etc.
 		}
+		log.Debug("Package file: %s", file)
 		g.Go(func() error {
 			f, err := os.Open(file)
 			if err != nil {
@@ -230,7 +278,10 @@ func loadPackageInfo(files []string) ([]*packages.Package, error) {
 			}
 			// Update the ExportFile paths to include the generated prefix
 			for _, pkg := range lpkgs {
-				pkg.ExportFile = filepath.Join("plz-out/gen", pkg.ExportFile)
+				// Undo the hack from packageinfo.go
+				before, _, _ := strings.Cut(pkg.ExportFile, "|")
+				pkg.ExportFile = filepath.Join("plz-out/gen", before)
+				pkg.CompiledGoFiles = pkg.GoFiles
 			}
 			lock.Lock()
 			defer lock.Unlock()
@@ -247,7 +298,13 @@ func loadPackageInfo(files []string) ([]*packages.Package, error) {
 func loadStdlibPackages() ([]*packages.Package, error) {
 	// We just list the entire stdlib set, it's not worth trying to filter it right now.
 	log.Debug("Loading stdlib packages...")
-	cmd := exec.Command("go", "list", "-json", "std")
+	goTool := "go"
+	// This is a hack to try to closer match what various plz things do.
+	// As noted above, this will go away once we move everything to go_toolchain / go_stdlib.
+	if env := os.Getenv("TOOLS_GO"); env != "" {
+		goTool = env
+	}
+	cmd := exec.Command(goTool, "list", "-json", "std")
 	cmd.Stderr = &bytes.Buffer{}
 	cmd.Stdout = &bytes.Buffer{}
 	if err := cmd.Run(); err != nil {
@@ -262,7 +319,7 @@ func loadStdlibPackages() ([]*packages.Package, error) {
 		} else if err != nil {
 			return nil, err
 		}
-		pkgs = append(pkgs, packageinfo.FromBuildPackage(pkg))
+		pkgs = append(pkgs, packageinfo.FromBuildPackage(pkg, "", ""))
 	}
 	return pkgs, nil
 }
@@ -279,7 +336,20 @@ func handleSubprocessErr(cmd *exec.Cmd, err error) error {
 func directoriesToFiles(in []string, includeTests bool) ([]string, error) {
 	files := make([]string, 0, len(in))
 	for _, x := range in {
-		if info, err := os.Stat(x); err != nil {
+		if strings.HasSuffix(x, "/...") {
+			// We could turn this into a `/...` style thing for plz but we also need to know the
+			// directories later to populate the roots correctly.
+			if err := filepath.WalkDir(strings.TrimSuffix(x, "/..."), func(path string, d fs.DirEntry, err error) error {
+				if err != nil {
+					return err
+				} else if strings.HasSuffix(path, ".go") && (d.Type()&fs.ModeSymlink) == 0 {
+					files = append(files, path)
+				}
+				return nil
+			}); err != nil {
+				return nil, err
+			}
+		} else if info, err := os.Stat(x); err != nil {
 			return nil, err
 		} else if info.IsDir() {
 			for _, f := range allGoFilesInDir(x, includeTests) {
@@ -306,4 +376,9 @@ func allGoFilesInDir(dirname string, includeTests bool) []string {
 		}
 	}
 	return files
+}
+
+func pathExists(filename string) bool {
+	_, err := os.Lstat(filename)
+	return err == nil
 }

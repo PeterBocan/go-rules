@@ -43,6 +43,12 @@ func argsFile(args []string) (string, error) {
 	return p, err
 }
 
+// root returns the root path of the Go toolchain. It is derived from the value of GoTool, which is
+// typically located at bin/go beneath the root path.
+func (tc *Toolchain) root() string {
+	return filepath.Dir(filepath.Dir(tc.GoTool))
+}
+
 // CGO invokes go tool cgo to generate cgo sources in the target's object directory
 func (tc *Toolchain) CGO(sourceDir string, objectDir string, cFlags []string, cgoFiles []string) ([]string, []string, error) {
 	// Looking at `go build -work -n -a`, there's also `_cgo_main.c` that gets taken into account,
@@ -130,18 +136,19 @@ func (tc *Toolchain) Link(archive, out, importcfg string, ldFlags []string) erro
 }
 
 // Symabis will generate the asm header as well as the abi symbol file for the provided asm files.
-func (tc *Toolchain) Symabis(sourceDir, objectDir string, asmFiles []string) (string, string, error) {
+func (tc *Toolchain) Symabis(importpath, sourceDir, objectDir string, asmFiles []string) (string, string, error) {
 	asmH := fmt.Sprintf("%s/go_asm.h", objectDir)
 	symabis := fmt.Sprintf("%s/symabis", objectDir)
 
+	if importpath != "" {
+		importpath = fmt.Sprintf("-p %s", importpath)
+	}
 	// the gc Toolchain does this
 	if err := tc.Exec.Run("touch %s", asmH); err != nil {
 		return "", "", err
 	}
 
-	// Although we don't set both `-p` and `-trimpath` flag here, they show up in `go build -work -n -a`.
-	// It doesn't seem to cause things to break without them so far, but leaving this note here for future reference.
-	err := tc.Exec.Run("(cd %s; %s tool asm -I %s -I %s/pkg/include -D GOOS_%s -D GOARCH_%s -gensymabis -o %s %s)", sourceDir, tc.GoTool, objectDir, build.Default.GOROOT, build.Default.GOOS, build.Default.GOARCH, symabis, paths(asmFiles))
+	err := tc.Exec.Run("(cd %s; %s tool asm -I %s -I %s/pkg/include -D GOOS_%s -D GOARCH_%s -gensymabis %s -o %s %s)", sourceDir, tc.GoTool, objectDir, tc.root(), build.Default.GOOS, build.Default.GOARCH, importpath, symabis, paths(asmFiles))
 
 	return asmH, symabis, err
 }
@@ -161,7 +168,7 @@ func (tc *Toolchain) Asm(importpath, sourceDir, objectDir, trimpath string, asmF
 		baseObjFile := strings.TrimSuffix(filepath.Base(asmFile), ".s") + ".o"
 		objFiles[i] = filepath.Join(objectDir, baseObjFile)
 
-		err := tc.Exec.Run("(cd %s; %s tool asm %s %s -I %s -I %s/pkg/include -D GOOS_%s -D GOARCH_%s -o %s %s)", sourceDir, tc.GoTool, importpath, trimpath, objectDir, build.Default.GOROOT, build.Default.GOOS, build.Default.GOARCH, objFiles[i], asmFile)
+		err := tc.Exec.Run("(cd %s; %s tool asm %s %s -I %s -I %s/pkg/include -D GOOS_%s -D GOARCH_%s -o %s %s)", sourceDir, tc.GoTool, importpath, trimpath, objectDir, tc.root(), build.Default.GOOS, build.Default.GOARCH, objFiles[i], asmFile)
 		if err != nil {
 			return nil, err
 		}
@@ -194,4 +201,10 @@ func (tc *Toolchain) pkgConfig(cmd string, cfgs []string) ([]string, error) {
 		return nil, fmt.Errorf("failed to resolve pkg configs %v: %w", cfgs, err)
 	}
 	return strings.Fields(string(out)), nil
+}
+
+// GoMinorVersion invokes the GoMinorVersion from a toolchain with the given Go binary.
+func GoMinorVersion(goTool string) (int, error) {
+	tc := Toolchain{GoTool: goTool}
+	return tc.GoMinorVersion()
 }

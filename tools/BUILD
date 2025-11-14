@@ -1,11 +1,11 @@
-VERSION = "1.4.3"
+VERSION = "1.21.0"
 
 hashes = {
-    "darwin_amd64": "9209ecdcf63d8c1b55a19c751fb5db3c6e3886088776b4c58b9ec0e3bc253154",
-    "darwin_arm64": "ff88728286bd528ce6f798e8ec81bd668248365de8fe73955018498e9a0ba2e9",
-    "freebsd_amd64": "cb5a9bad2405c6fae2fb64a8a5bc5aee2567b43c79108c77b37558df25cc4950",
-    "linux_amd64": "d4e670a9803ceba54f8e899d3d3fddb5d41cc3106bec047b4fb8e85e87fd593d",
-    "linux_arm64": "57c89ebe4da7dfb3401e2be0be7e4a21ffc3d9d866cc198a4479f7c7f734be07",
+    "darwin_amd64": "ed105de84226521ee70756558f028c63a380da433eede6e01bb2abe76fb63b90",
+    "darwin_arm64": "2553c598cc7eb9915072d080da17f9a8e5b398ef8c548c29ec46203d7da96b83",
+    "freebsd_amd64": "e46e349363fccd0865e7744f19c2de684d5ee21f4e7611bdf802c599c09bcdea",
+    "linux_amd64": "1e2407960085e4735523e3d27023a1483037ac62dfd4e7473c6fd4f5a58f2471",
+    "linux_arm64": "e2aea3747fe88b386d0bc9244804665bf03ea491f30a36ddeff116a317d2dc48",
 }
 
 for a, h in hashes.items():
@@ -14,7 +14,6 @@ for a, h in hashes.items():
         name = "please_go" if native else f"please_go_{a}",
         binary = True,
         hashes = [h],
-        labels = None if native else ["manual"],  # Needed to avoid picking this up for other architectures for coverage
         url = f"https://github.com/please-build/go-rules/releases/download/please-go-v{VERSION}/please_go-{VERSION}-{a}",
         visibility = ["PUBLIC"] if native else None,
     )

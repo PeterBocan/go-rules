@@ -1,90 +1,181 @@
 package generate
 
 import (
+	"bufio"
 	"fmt"
 	"go/build"
+	"io/fs"
+	"log"
 	"os"
+	"path"
 	"path/filepath"
+	"slices"
 	"strings"
-
-	"golang.org/x/mod/modfile"
 
 	bazelbuild "github.com/bazelbuild/buildtools/build"
 	bazeledit "github.com/bazelbuild/buildtools/edit"
+
+	"github.com/please-build/go-rules/tools/please_go/generate/gomoddeps"
 )
 
 type Generate struct {
 	moduleName         string
+	moduleArg          string
 	srcRoot            string
+	subrepo            string
 	buildContext       build.Context
-	modFile            string
+	hostModFile        string
 	buildFileNames     []string
 	moduleDeps         []string
-	pluginTarget       string
 	replace            map[string]string
 	knownImportTargets map[string]string // cache these so we don't end up looping over all the modules for every import
 	thirdPartyFolder   string
 	install            []string
+	labels             []string
+	largePackages      []string
 }
 
-func New(srcRoot, thirdPartyFolder, modFile, module string, buildFileNames, moduleDeps, install []string) *Generate {
+func New(srcRoot, thirdPartyFolder, hostModFile, module, version, subrepo string, buildFileNames, moduleDeps, install []string, buildTags []string, labels []string, largePackages []string) *Generate {
+	moduleArg := module
+	if version != "" {
+		moduleArg += "@" + version
+	}
+
+	ctxt := build.Default
+	ctxt.BuildTags = buildTags
+
 	return &Generate{
 		srcRoot:            srcRoot,
-		buildContext:       build.Default,
+		buildContext:       ctxt,
 		buildFileNames:     buildFileNames,
 		moduleDeps:         moduleDeps,
-		modFile:            modFile,
+		hostModFile:        hostModFile,
 		knownImportTargets: map[string]string{},
 		thirdPartyFolder:   thirdPartyFolder,
 		install:            install,
 		moduleName:         module,
+		moduleArg:          moduleArg,
+		subrepo:            subrepo,
+		labels:             labels,
+		largePackages:      largePackages,
 	}
 }
 
 // Generate generates a new Please project at the src root. It will walk through the directory tree generating new BUILD
 // files. This is primarily intended to generate a please subrepo for third party code.
 func (g *Generate) Generate() error {
-	if err := g.readGoMod(g.modFile); err != nil {
+	deps, replacements, err := gomoddeps.GetCombinedDepsAndReplacements(g.hostModFile, path.Join(g.srcRoot, "go.mod"))
+	if err != nil {
 		return err
 	}
+	// It's important to not override g.moduleDeps as it can already contains dependencies configured
+	// when `Generate` was constructed.
+	g.moduleDeps = append(g.moduleDeps, deps...)
+	g.moduleDeps = append(g.moduleDeps, g.moduleName)
+	g.replace = replacements
+
 	if err := g.writeConfig(); err != nil {
-		return err
+		return fmt.Errorf("failed to write config: %w", err)
 	}
+	if err := g.parseImportConfigs(); err != nil {
+		return fmt.Errorf("failed to parse import configs: %w", err)
+	}
+
 	if err := g.generateAll(g.srcRoot); err != nil {
-		return err
+		return fmt.Errorf("failed to generate BUILD files: %w", err)
 	}
 	return g.writeInstallFilegroup()
 }
 
-func (g *Generate) installTargets() []string {
+// parseImportConfigs walks through the build dir looking for .importconfig files, parsing the # please:target //foo:bar
+// comments to generate the known imports. These are the deps that are passed to the go_repo e.g. for legacy go_module
+// rules.
+func (g *Generate) parseImportConfigs() error {
+	return filepath.WalkDir(".", func(path string, d fs.DirEntry, err error) error {
+		if filepath.Ext(path) == ".importconfig" {
+			target, pkgs, err := parseImportConfig(path)
+			if err != nil {
+				return err
+			}
+			if target == "" {
+				return nil
+			}
+			for _, p := range pkgs {
+				g.knownImportTargets[p] = target
+			}
+		}
+		return nil
+	})
+}
+
+func parseImportConfig(path string) (string, []string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", nil, err
+	}
+	defer f.Close()
+
+	target := ""
+	var imports []string
+
+	importCfg := bufio.NewScanner(f)
+	for importCfg.Scan() {
+		line := importCfg.Text()
+		if strings.HasPrefix(line, "#") {
+			if strings.HasPrefix(line, "# please:target ") {
+				target = strings.TrimSpace(strings.TrimPrefix(line, "# please:target "))
+				if !strings.HasPrefix(target, "///") {
+					target = "@" + target
+				}
+			}
+			continue
+		}
+		parts := strings.Split(strings.TrimPrefix(line, "packagefile "), "=")
+		imports = append(imports, parts[0])
+	}
+	return target, imports, nil
+}
+
+func (g *Generate) installTargets() ([]string, error) {
 	var targets []string
 
 	for _, i := range g.install {
 		dir := filepath.Join(g.srcRoot, i)
 		if strings.HasSuffix(dir, "/...") {
-			targets = append(targets, g.targetsInDir(strings.TrimSuffix(dir, "/..."))...)
+			ts, err := g.targetsInDir(strings.TrimSuffix(dir, "/..."))
+			if err != nil {
+				return nil, err
+			}
+			targets = append(targets, ts...)
 		} else {
-			targets = append(targets, g.libTargetForPleasePackage(i))
+			t, err := g.libTargetForBuildPackage(i)
+			if err != nil {
+				return nil, err
+			}
+			if t == "" {
+				return nil, fmt.Errorf("couldn't find install package %v", i)
+			}
+			targets = append(targets, t)
 		}
 	}
-	return targets
+	return targets, nil
 }
 
-func (g *Generate) targetsInDir(dir string) []string {
+func (g *Generate) targetsInDir(dir string) ([]string, error) {
 	var ret []string
 	err := filepath.WalkDir(dir, func(path string, info os.DirEntry, err error) error {
-		// The assumption here is that if we generated a BUILD file, then we would have generated a go_library() target
-		// for that package. Currently, we don't generate BUILD files for any other reason so this assumption holds
-		// true. We may want to check that the BUILD file contains a go_library() target otherwise.
 		if g.isBuildFile(path) {
-			ret = append(ret, g.libTargetForPleasePackage(trimPath(filepath.Dir(path), g.srcRoot)))
+			t, err := g.libTargetForBuildFile(trimPath(path, g.srcRoot))
+			if err != nil {
+				return err
+			}
+			if t != "" {
+				ret = append(ret, t)
+			}
 		}
 		return nil
 	})
-	if err != nil {
-		panic(err)
-	}
-	return ret
+	return ret, err
 }
 
 func (g *Generate) isBuildFile(file string) bool {
@@ -104,40 +195,16 @@ func (g *Generate) writeInstallFilegroup() error {
 	}
 
 	rule := NewRule("filegroup", "installs")
-	rule.SetAttr("exported_deps", NewStringList(g.installTargets()))
+	installTargets, err := g.installTargets()
+	if err != nil {
+		return fmt.Errorf("failed to generate install targets: %v", err)
+	}
+	rule.SetAttr("exported_deps", NewStringList(installTargets))
 	rule.SetAttr("visibility", NewStringList([]string{"PUBLIC"}))
 
 	buildFile.Stmt = append(buildFile.Stmt, rule.Call)
 
 	return saveBuildFile(buildFile)
-}
-
-// readGoMod reads the module dependencies
-func (g *Generate) readGoMod(path string) error {
-	if path == "" {
-		path = filepath.Join(g.srcRoot, "go.mod")
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return err
-	}
-	modFile, err := modfile.ParseLax(path, data, nil)
-	if err != nil {
-		return err
-	}
-
-	// TODO we could probably validate these are known modules
-	for _, req := range modFile.Require {
-		g.moduleDeps = append(g.moduleDeps, req.Mod.Path)
-	}
-
-	g.moduleDeps = append(g.moduleDeps, g.moduleName)
-
-	g.replace = make(map[string]string, len(modFile.Replace))
-	for _, replace := range modFile.Replace {
-		g.replace[replace.Old.Path] = replace.New.Path
-	}
-	return nil
 }
 
 func (g *Generate) writeConfig() error {
@@ -150,6 +217,9 @@ func (g *Generate) writeConfig() error {
 	fmt.Fprintln(file, "[Plugin \"go\"]")
 	fmt.Fprintln(file, "Target=@//plugins:go")
 	fmt.Fprintf(file, "ImportPath=%s\n", g.moduleName)
+	for _, t := range g.buildContext.BuildTags {
+		fmt.Fprintf(file, "BuildTags=%s\n", t)
+	}
 	return nil
 }
 
@@ -188,7 +258,22 @@ func (g *Generate) pkgDir(target string) string {
 
 func (g *Generate) importDir(target string) (*build.Package, error) {
 	dir := filepath.Join(os.Getenv("TMP_DIR"), g.pkgDir(target))
-	return g.buildContext.ImportDir(dir, 0)
+	pkg, err := g.buildContext.ImportDir(dir, 0)
+	if err != nil {
+		return nil, err
+	}
+	// We also need to discover & attach any .a files in the directory; some libraries use these
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	pkg.IgnoredOtherFiles = nil
+	for _, entry := range entries {
+		if name := entry.Name(); strings.HasSuffix(name, ".a") {
+			pkg.IgnoredOtherFiles = append(pkg.IgnoredOtherFiles, name)
+		}
+	}
+	return pkg, nil
 }
 
 func (g *Generate) generate(dir string) error {
@@ -197,12 +282,25 @@ func (g *Generate) generate(dir string) error {
 		return err
 	}
 
-	lib := g.libRule(pkg, dir)
+	// filter out pkg.GoFiles based on build tags
+	var goFiles []string
+	for _, f := range pkg.GoFiles {
+		match, err := g.buildContext.MatchFile(pkg.Dir, f)
+		if err != nil {
+			return err
+		}
+		if match {
+			goFiles = append(goFiles, f)
+		}
+	}
+
+	pkg.GoFiles = goFiles
+	lib := g.ruleForPackage(pkg, dir)
 	if lib == nil {
 		return nil
 	}
 
-	return g.createBuildFile(dir, lib)
+	return g.createBuildFile(dir, lib, pkg.IgnoredOtherFiles)
 }
 
 func (g *Generate) matchesInstall(dir string) bool {
@@ -223,6 +321,10 @@ func (g *Generate) rule(rule *Rule) *bazelbuild.Rule {
 	r := NewRule(rule.kind, rule.name)
 	populateRule(r, rule)
 	r.SetAttr("visibility", NewStringList([]string{"PUBLIC"}))
+	r.SetAttr("labels", NewStringList(g.labels))
+	if rule.kind == "go_library" {
+		r.SetAttr("cover", &bazelbuild.Ident{Name: "False"})
+	}
 
 	return r
 }
@@ -256,7 +358,7 @@ func saveBuildFile(buildFile *bazelbuild.File) error {
 	return err
 }
 
-func (g *Generate) createBuildFile(pkg string, rule *Rule) error {
+func (g *Generate) createBuildFile(pkg string, rule *Rule, aFiles []string) error {
 	buildFile, err := parseOrCreateBuildFile(g.pkgDir(pkg), g.buildFileNames)
 	if err != nil {
 		return err
@@ -278,6 +380,12 @@ func (g *Generate) createBuildFile(pkg string, rule *Rule) error {
 
 	buildFile.Stmt = append(buildFile.Stmt, g.rule(rule).Call)
 
+	if len(aFiles) != 0 {
+		filegroup := NewRule("filegroup", "a_files")
+		filegroup.SetAttr("srcs", NewStringList(aFiles))
+		buildFile.Stmt = append(buildFile.Stmt, filegroup.Call)
+	}
+
 	return saveBuildFile(buildFile)
 }
 
@@ -294,6 +402,13 @@ func NewRule(kind, name string) *bazelbuild.Rule {
 
 func NewStringExpr(s string) *bazelbuild.StringExpr {
 	return &bazelbuild.StringExpr{Value: s}
+}
+
+func NewBoolExpr(v bool) bazelbuild.Expr {
+	if v {
+		return &bazelbuild.LiteralExpr{Token: "True"}
+	}
+	return &bazelbuild.LiteralExpr{Token: "False"}
 }
 
 func NewStringList(ss []string) *bazelbuild.ListExpr {
@@ -330,26 +445,43 @@ func (g *Generate) depTargets(imports []string) []string {
 	return deps
 }
 
-func (g *Generate) libRule(pkg *build.Package, dir string) *Rule {
+func (g *Generate) ruleForPackage(pkg *build.Package, dir string) *Rule {
 	if len(pkg.GoFiles) == 0 && len(pkg.CgoFiles) == 0 {
 		return nil
 	}
 
 	name := nameForLibInPkg(g.moduleName, trimPath(dir, g.srcRoot))
+	deps := g.depTargets(pkg.Imports)
+	if len(pkg.IgnoredOtherFiles) != 0 {
+		deps = append(deps, ":a_files")
+	}
 
 	return &Rule{
-		name:          name,
-		kind:          packageKind(pkg),
-		srcs:          pkg.GoFiles,
-		cgoSrcs:       pkg.CgoFiles,
-		compilerFlags: pkg.CgoCFLAGS,
-		linkerFlags:   pkg.CgoLDFLAGS,
-		pkgConfigs:    pkg.CgoPkgConfig,
-		asmFiles:      pkg.SFiles,
-		hdrs:          pkg.HFiles,
-		deps:          g.depTargets(pkg.Imports),
-		embedPatterns: pkg.EmbedPatterns,
+		name:           name,
+		kind:           packageKind(pkg),
+		srcs:           pkg.GoFiles,
+		module:         g.moduleArg,
+		subrepo:        g.subrepo,
+		cgoSrcs:        pkg.CgoFiles,
+		cSrcs:          pkg.CFiles,
+		compilerFlags:  pkg.CgoCFLAGS,
+		linkerFlags:    orderLinkerFlags(pkg.CgoLDFLAGS),
+		pkgConfigs:     pkg.CgoPkgConfig,
+		asmFiles:       pkg.SFiles,
+		hdrs:           pkg.HFiles,
+		deps:           deps,
+		embedPatterns:  pkg.EmbedPatterns,
+		isCMD:          pkg.IsCommand(),
+		isLargePackage: slices.Contains(g.largePackages, dir),
 	}
+}
+
+// orderLinkerFlags collapses linker flags into one to enforce a consistent ordering
+func orderLinkerFlags(in []string) []string {
+	if len(in) > 0 {
+		return []string{strings.Join(in, " ")}
+	}
+	return nil
 }
 
 func (g *Generate) depTarget(importPath string) string {
@@ -357,7 +489,7 @@ func (g *Generate) depTarget(importPath string) string {
 		return target
 	}
 
-	if replacement, ok := g.replace[importPath]; ok {
+	if replacement, ok := g.replace[importPath]; ok && replacement != importPath {
 		target := g.depTarget(replacement)
 		g.knownImportTargets[importPath] = target
 		return target
@@ -421,10 +553,25 @@ func trimPath(target, base string) string {
 	return strings.Join(targetParts[len(baseParts):], "/")
 }
 
-// libTargetForPleasePackage returns the build label for the go_library() target that would be generated for a package
-// at this path within the generated Please repo.
-func (g *Generate) libTargetForPleasePackage(pkg string) string {
-	return buildTarget(nameForLibInPkg(g.moduleName, pkg), pkg, "")
+// libTargetForBuildFile finds the go_library or cgo_library target in the package
+func (g *Generate) libTargetForBuildFile(path string) (string, error) {
+	bs, err := os.ReadFile(filepath.Join(g.srcRoot, path))
+	if err != nil {
+		return "", err
+	}
+	file, err := bazelbuild.ParseBuild(path, bs)
+	if err != nil {
+		return "", err
+	}
+
+	libs := append(file.Rules("go_library"), file.Rules("cgo_library")...)
+	if len(libs) >= 1 {
+		if len(libs) != 1 {
+			log.Fatalf("more than one go library in installed package %v", path)
+		}
+		return buildTarget(libs[0].Name(), filepath.Dir(path), ""), nil
+	}
+	return "", nil
 }
 
 func (g *Generate) subrepoName(module string) string {
@@ -432,6 +579,24 @@ func (g *Generate) subrepoName(module string) string {
 		return ""
 	}
 	return filepath.Join(g.thirdPartyFolder, strings.ReplaceAll(module, "/", "_"))
+}
+
+func (g *Generate) libTargetForBuildPackage(i string) (string, error) {
+	entries, err := os.ReadDir(filepath.Join(g.srcRoot, i))
+	if err != nil {
+		return "", err
+	}
+
+	for _, e := range entries {
+		if g.isBuildFile(e.Name()) {
+			t, err := g.libTargetForBuildFile(filepath.Join(i, e.Name()))
+			if err != nil {
+				return "", err
+			}
+			return t, nil
+		}
+	}
+	return "", nil
 }
 
 func buildTarget(name, pkgDir, subrepo string) string {

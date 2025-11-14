@@ -1,3 +1,5 @@
+GLOBL COLLIDINGSYMBOL<>(SB), 8, $32
+
 // func add(x, y int64)
 TEXT ·add(SB),$0-24
     MOVQ x+0(FP), BX

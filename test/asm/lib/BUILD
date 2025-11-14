@@ -3,7 +3,10 @@ subinclude("//build_defs:go")
 go_library(
     name = "asm",
     srcs = ["asm.go"],
-    asm_srcs = ["add.s"],
+    asm_srcs = [
+        "add.s",
+        "subtract.s",
+    ],
     deps = ["//test/asm/lib/golib"],
 )
 
@@ -14,6 +17,6 @@ go_test(
     labels = ["asm"],
     deps = [
         ":asm",
-        "//third_party/go:testify",
+        "///third_party/go/github.com_stretchr_testify//assert",
     ],
 )

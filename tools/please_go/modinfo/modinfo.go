@@ -12,6 +12,8 @@ import (
 	"runtime/debug"
 	"sort"
 	"strings"
+
+	"golang.org/x/mod/module"
 )
 
 // WriteModInfo writes mod info to the given output file
@@ -38,6 +40,7 @@ func WriteModInfo(goTool, modulePath, pkgPath, buildMode, cgoEnabled, goos, goar
 			{Key: "GOOS", Value: goos},
 		},
 	}
+	seen := map[string]struct{}{}
 	if err := filepath.WalkDir(".", func(path string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() || !strings.HasSuffix(path, ".modinfo") {
 			return err
@@ -46,11 +49,15 @@ func WriteModInfo(goTool, modulePath, pkgPath, buildMode, cgoEnabled, goos, goar
 		if err != nil {
 			return err
 		}
-		if module, version, found := strings.Cut(strings.TrimSpace(string(contents)), "@"); found {
-			bi.Deps = append(bi.Deps, &debug.Module{
-				Path:    module,
-				Version: version,
-			})
+		mod := strings.TrimSpace(string(contents))
+		if _, present := seen[mod]; !present {
+			seen[mod] = struct{}{}
+			if module, version, found := strings.Cut(mod, "@"); found {
+				bi.Deps = append(bi.Deps, &debug.Module{
+					Path:    module,
+					Version: version,
+				})
+			}
 		}
 		return nil
 	}); err != nil {
@@ -67,4 +74,18 @@ func modInfoData(modinfo string) string {
 	start, _ := hex.DecodeString("3077af0c9274080241e1c107e6d618e6")
 	end, _ := hex.DecodeString("f932433186182072008242104116d8f2")
 	return string(start) + modinfo + string(end)
+}
+
+// WriteModuleVersion generates a module version file for a third-party Go module.
+//
+// If validate is true, WriteModuleVersion additionally checks that the given module path and version are valid
+// according to Go's module version numbering standard.
+func WriteModuleVersion(modulePath, version string, validate bool, outputFile string) error {
+	if validate {
+		if err := module.Check(modulePath, version); err != nil {
+			return fmt.Errorf("invalid module path/version: %v", err)
+		}
+	}
+	canonicalVersion := module.CanonicalVersion(version)
+	return os.WriteFile(outputFile, []byte(fmt.Sprintf("%s@%s", modulePath, canonicalVersion)), 0644)
 }
